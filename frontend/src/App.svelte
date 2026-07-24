@@ -1,119 +1,117 @@
 <script>
-	import { onMount } from 'svelte';
-	let messages = [];
-	let input = '';
-	let isLoading = false;
-	let selectedModel = 'qwen2.5-coder:7b';
-	let models = [];
+  import { onMount } from 'svelte';
 
-	let currentResponse = '';
+  let projectPath = '';
+  let files = [];
+  let activeFile = '';
+  let content = '';
+  let messages = [{ role: 'assistant', content: 'LeonAgent 已就绪。选择项目目录后，可以浏览代码并与本地模型对话。' }];
+  let input = '';
+  let models = [];
+  let selectedModel = '';
+  let busy = false;
+  let branch = '';
+  let changes = [];
+  let stream = '';
 
-	async function loadModels() {
-		try {
-			const res = await window.go.main.App.GetModels();
-			models = res;
-			if (models.length > 0) selectedModel = models[0];
-		} catch(e) {
-			console.error(e);
-		}
-	}
+  onMount(async () => {
+    window.runtime.EventsOn('chat-stream', chunk => {
+      stream += chunk;
+      const last = messages[messages.length - 1];
+      if (last?.role === 'assistant' && last.streaming) {
+        last.content = stream;
+        messages = [...messages];
+      } else {
+        messages = [...messages, { role: 'assistant', content: stream, streaming: true }];
+      }
+    });
+    window.runtime.EventsOn('chat-done', () => { busy = false; stream = ''; messages = messages.map(m => ({...m, streaming: false})); });
+    window.runtime.EventsOn('chat-error', error => { busy = false; messages = [...messages, { role: 'assistant', content: `错误：${error}` }]; });
+    try { models = await window.go.main.App.GetModels(); selectedModel = models[0] || ''; } catch (_) {}
+    try { projectPath = await window.go.main.App.GetHomeDir(); await openFolder(projectPath); } catch (_) {}
+  });
 
-	async function sendMessage() {
-		if (!input.trim() || isLoading) return;
+  async function openFolder(path) {
+    projectPath = path;
+    files = await window.go.main.App.ListDir(path);
+    await refreshGit();
+  }
 
-		messages = [...messages, { role: 'user', content: input }];
-		const userMsg = input;
-		input = '';
-		isLoading = true;
-		currentResponse = '';
+  async function openEntry(entry) {
+    if (entry.isDir) return openFolder(entry.path);
+    activeFile = entry.path;
+    content = await window.go.main.App.ReadFile(entry.path);
+  }
 
-		try {
-			await window.go.main.App.Chat({
-				model: selectedModel,
-				message: userMsg,
-				history: messages.slice(0, -1)
-			});
-		} catch(e) {
-			console.error(e);
-		}
-	}
+  async function saveFile() {
+    if (!activeFile) return;
+    await window.go.main.App.WriteFile(activeFile, content);
+    await refreshGit();
+  }
 
-	// 监听流式返回
-	onMount(() => {
-		loadModels();
+  async function refreshGit() {
+    try {
+      const status = await window.go.main.App.GetGitStatus(projectPath);
+      branch = status.branch;
+      changes = status.changes || [];
+    } catch (_) { branch = ''; changes = []; }
+  }
 
-		window.runtime.EventsOn("chat-stream", (chunk) => {
-			currentResponse += chunk;
-			// 更新最后一条 assistant 消息
-			if (messages.length > 0 && messages[messages.length-1].role === 'assistant') {
-				messages[messages.length-1].content = currentResponse;
-			} else {
-				messages = [...messages, { role: 'assistant', content: currentResponse }];
-			}
-		});
-
-		window.runtime.EventsOn("chat-done", () => {
-			isLoading = false;
-			currentResponse = '';
-		});
-
-		window.runtime.EventsOn("chat-error", (err) => {
-			isLoading = false;
-			messages = [...messages, { role: 'assistant', content: `❌ 错误: ${err}` }];
-		});
-	});
+  async function send() {
+    const text = input.trim();
+    if (!text || busy || !selectedModel) return;
+    const history = messages.filter(m => !m.streaming).map(({role, content}) => ({role, content}));
+    messages = [...messages, { role: 'user', content: text }];
+    input = '';
+    busy = true;
+    stream = '';
+    await window.go.main.App.Chat({ model: selectedModel, message: text, history });
+  }
 </script>
 
-<div class="h-screen flex flex-col bg-gray-950 text-white">
-	<!-- Header -->
-	<div class="p-4 border-b border-gray-800 flex items-center justify-between bg-gray-900">
-		<h1 class="text-xl font-bold flex items-center gap-2">
-			<span>🧠</span> LeonAgent
-		</h1>
-		<select bind:value={selectedModel} class="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700">
-			{#each models as model}
-				<option value={model}>{model}</option>
-			{/each}
-		</select>
-	</div>
+<div class="app-shell">
+  <header>
+    <div><strong>LeonAgent</strong><span>Local coding workspace</span></div>
+    <select bind:value={selectedModel} aria-label="模型">
+      {#if models.length === 0}<option value="">Ollama 未连接</option>{/if}
+      {#each models as model}<option value={model}>{model}</option>{/each}
+    </select>
+  </header>
 
-	<!-- Messages -->
-	<div class="flex-1 overflow-y-auto p-6 space-y-6">
-		{#each messages as msg}
-			<div class={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-				<div class={`max-w-[80%] px-5 py-3 rounded-2xl ${
-					msg.role === 'user' ? 'bg-blue-600' : 'bg-gray-800'
-				}`}>
-					{msg.content}
-				</div>
-			</div>
-		{/each}
-		{#if isLoading && currentResponse}
-			<div class="flex justify-start">
-				<div class="bg-gray-800 px-5 py-3 rounded-2xl">
-					{currentResponse}
-				</div>
-			</div>
-		{/if}
-	</div>
+  <main>
+    <aside class="explorer">
+      <div class="panel-title"><span>项目</span><button on:click={() => openFolder(projectPath)}>刷新</button></div>
+      <div class="path">{projectPath || '未选择目录'}</div>
+      <div class="file-list">
+        {#each files as file}
+          <button class:active={activeFile === file.path} on:click={() => openEntry(file)}>
+            <span>{file.isDir ? '▸' : '·'}</span><span>{file.name}</span>
+          </button>
+        {/each}
+      </div>
+      <div class="git-box">
+        <div><b>Git</b><span>{branch || '非仓库'}</span></div>
+        <small>{changes.length} 个变更</small>
+        {#each changes.slice(0, 6) as change}<code>{change}</code>{/each}
+      </div>
+    </aside>
 
-	<!-- Input -->
-	<div class="p-4 border-t border-gray-800 bg-gray-900">
-		<div class="flex gap-3">
-			<input
-			bind:value={input}
-			on:keydown={(e) => e.key === 'Enter' && sendMessage()}
-			placeholder="输入编程需求，例如：帮我写一个 Go HTTP API..."
-			class="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-5 py-4 focus:outline-none focus:border-blue-500"
-			disabled={isLoading}
-			/>
-			<button
-			on:click={sendMessage}
-			disabled={isLoading || !input.trim()}
-			class="bg-emerald-600 hover:bg-emerald-500 px-8 rounded-xl disabled:bg-gray-700"
-			>
-				发送
-			</button>
-		</div>
-	</div>
+    <section class="editor">
+      <div class="panel-title"><span>{activeFile ? activeFile.split('/').pop() : '编辑器'}</span><button disabled={!activeFile} on:click={saveFile}>保存 ⌘S</button></div>
+      <textarea bind:value={content} spellcheck="false" placeholder="从左侧选择文件"></textarea>
+    </section>
+
+    <section class="chat">
+      <div class="panel-title"><span>Agent</span><span class:online={selectedModel}>{selectedModel ? '本地模型在线' : '等待 Ollama'}</span></div>
+      <div class="messages">
+        {#each messages as message}
+          <article class:user={message.role === 'user'}><b>{message.role === 'user' ? '你' : 'LeonAgent'}</b><p>{message.content}</p></article>
+        {/each}
+      </div>
+      <div class="composer">
+        <textarea bind:value={input} on:keydown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), send())} placeholder="描述要分析或实现的任务…"></textarea>
+        <button on:click={send} disabled={busy || !selectedModel || !input.trim()}>{busy ? '生成中' : '发送'}</button>
+      </div>
+    </section>
+  </main>
 </div>
